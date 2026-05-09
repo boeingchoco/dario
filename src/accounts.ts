@@ -22,9 +22,11 @@ import { homedir } from 'node:os';
 import { randomUUID, randomBytes, createHash } from 'node:crypto';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { detectCCOAuthConfig } from './cc-oauth-detect.js';
-import { loadCredentials } from './oauth.js';
+import { loadCredentials, buildManualAuthorizeUrl, parseManualPaste, readLineFromStdin } from './oauth.js';
 import { openBrowser } from './open-browser.js';
 import { redactSecrets } from './redact.js';
+
+const MANUAL_REDIRECT_URI = 'https://platform.claude.com/oauth/code/callback';
 
 const DARIO_DIR = join(homedir(), '.dario');
 const ACCOUNTS_DIR = join(DARIO_DIR, 'accounts');
@@ -356,6 +358,90 @@ export async function addAccountViaOAuth(alias: string): Promise<AccountCredenti
   });
 }
 
+/**
+ * Manual / headless flow for `dario accounts add` — the pool-mode counterpart
+ * to `startManualOAuthFlow` in oauth.ts. Prints the authorize URL, asks the
+ * user to paste back `code#state` from Anthropic's success page, exchanges
+ * for tokens, saves to `~/.dario/accounts/<alias>.json`.
+ *
+ * Used when a localhost-callback flow can't reach the dario process — SSH
+ * sessions, containers — and as the on-Windows escape hatch when the URL
+ * dispatch chain (rundll32 / explorer) can't be relied on to deliver the
+ * full URL to the browser.
+ */
+export async function addAccountViaManualOAuth(alias: string): Promise<AccountCredentials> {
+  const cfg = await detectCCOAuthConfig();
+  const { codeVerifier, codeChallenge } = generatePKCE();
+  // 32-byte state — same constraint as the auto flow. See dario#71.
+  const state = base64url(randomBytes(32));
+  const authUrl = buildManualAuthorizeUrl(cfg, codeChallenge, state);
+
+  console.log('');
+  console.log(`  Open this URL in any browser to add account "${alias}":`);
+  console.log('');
+  console.log(`    ${authUrl}`);
+  console.log('');
+  console.log('  Sign in with the Claude account you want to add. After you approve,');
+  console.log('  Anthropic will display an authorization code. Paste it below');
+  console.log('  (format: "code#state" or just the code).');
+  console.log('');
+
+  const pasted = await readLineFromStdin('  Code: ');
+  const { code, state: returnedState } = parseManualPaste(pasted);
+
+  if (!code) {
+    throw new Error(`No authorization code entered. Re-run \`dario accounts add ${alias} --manual\`.`);
+  }
+
+  if (returnedState && returnedState !== state) {
+    throw new Error(`State mismatch — the pasted code is from a different login attempt. Re-run \`dario accounts add ${alias} --manual\` and paste the most recent code.`);
+  }
+
+  const tokenRes = await fetch(cfg.tokenUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      grant_type: 'authorization_code',
+      client_id: cfg.clientId,
+      code,
+      redirect_uri: MANUAL_REDIRECT_URI,
+      code_verifier: codeVerifier,
+      state,
+    }),
+    signal: AbortSignal.timeout(30_000),
+  });
+
+  if (!tokenRes.ok) {
+    const body = await tokenRes.text().catch(() => '');
+    throw new Error(`Token exchange failed (${tokenRes.status}): ${redactSecrets(body.slice(0, 200))}`);
+  }
+
+  const tokens = await tokenRes.json() as {
+    access_token: string;
+    refresh_token: string;
+    expires_in: number;
+    scope?: string;
+  };
+
+  const identity = (await detectClaudeIdentity()) ?? {
+    deviceId: randomUUID(),
+    accountUuid: randomUUID(),
+  };
+
+  const creds: AccountCredentials = {
+    alias,
+    accessToken: tokens.access_token,
+    refreshToken: tokens.refresh_token,
+    expiresAt: Date.now() + tokens.expires_in * 1000,
+    scopes: tokens.scope?.split(' ') ?? cfg.scopes.split(' '),
+    deviceId: identity.deviceId,
+    accountUuid: identity.accountUuid,
+  };
+
+  await saveAccount(creds);
+  return creds;
+}
+
 export function getAccountsDir(): string {
   return ACCOUNTS_DIR;
 }
@@ -422,4 +508,61 @@ export async function ensureLoginCredentialsInPool(
   });
 
   return alias;
+}
+
+/**
+ * Detect divergence between `accounts/login.json` and the current
+ * `credentials.json` (or whichever store loadCredentials finds), and
+ * re-sync if they differ. Returns one of:
+ *   - 'no-pool'      : pool is single-account, nothing to do
+ *   - 'no-login'     : pool active but no `login` alias — back-fill
+ *                       was never run, nothing to do
+ *   - 'no-creds'     : login.json exists but no current credentials
+ *                       reachable to compare against — leave alone
+ *   - 'in-sync'      : tokens match; no action
+ *   - 'resynced'     : login.json was stale; overwrote with current
+ *                       credentials. Caller should reload pool state
+ *
+ * Why: the single-account path keeps refreshing `credentials.json` in
+ * the background (proxy startup auth check, periodic refresh in oauth.ts).
+ * Each refresh issues new tokens and Anthropic invalidates the previous
+ * refresh_token. The pool's `login.json` snapshot — frozen at back-fill
+ * time — is now wrong on both fields, but its `expiresAt` metadata still
+ * says "healthy" so the selector keeps picking it. Detect this at startup
+ * and overwrite with the current canonical content. dario#235.
+ */
+export async function resyncLoginFromCredentialsIfStale(): Promise<
+  'no-pool' | 'no-login' | 'no-creds' | 'in-sync' | 'resynced'
+> {
+  const aliases = await listAccountAliases();
+  if (aliases.length < 2) return 'no-pool';
+  if (!aliases.includes(MIGRATED_LOGIN_ALIAS)) return 'no-login';
+
+  const loginAcc = await loadAccount(MIGRATED_LOGIN_ALIAS);
+  if (!loginAcc) return 'no-login';
+
+  const creds = await loadCredentials();
+  const tok = creds?.claudeAiOauth;
+  if (!tok?.accessToken || !tok?.refreshToken) return 'no-creds';
+
+  if (
+    loginAcc.accessToken === tok.accessToken &&
+    loginAcc.refreshToken === tok.refreshToken
+  ) {
+    return 'in-sync';
+  }
+
+  // Tokens diverged — credentials.json has refreshed since last back-fill.
+  // Overwrite the snapshot, preserving deviceId/accountUuid (they don't
+  // rotate with token refresh; they're pool-internal identity).
+  await saveAccount({
+    alias: MIGRATED_LOGIN_ALIAS,
+    accessToken: tok.accessToken,
+    refreshToken: tok.refreshToken,
+    expiresAt: tok.expiresAt,
+    scopes: tok.scopes ?? loginAcc.scopes ?? [],
+    deviceId: loginAcc.deviceId,
+    accountUuid: loginAcc.accountUuid,
+  });
+  return 'resynced';
 }
