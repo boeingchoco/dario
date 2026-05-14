@@ -11,6 +11,34 @@ checklist.
 
 ## [Unreleased]
 
+## [3.38.0] - 2026-05-14
+
+### Added — response-correlated think time + session-start jitter (#267)
+
+Closes the behavioral/temporal axis the wire-fidelity work doesn't touch. Existing inter-request pacing (`--pace-min`, `--pace-jitter`) enforces a floor on wall-clock distance between requests but doesn't model two patterns present in real interactive CC sessions and absent in machine-paced agent loops:
+
+1. **Post-response read time correlated with response length.** Real users read the response before sending the next message; long responses → longer pauses. Agent loops fire the next request as soon as the client can stamp one out — a detectable inter-arrival distribution.
+2. **Session-start latency.** Every new session-id (single-account rotation, first startup) previously fired the first request at machine speed (`lastRequestTime=0` short-circuited pacing). Every session opened identically — a long-run statistical signal. Real CC users open a session by opening the binary and typing — seconds of latency, not microseconds.
+
+Six new opt-in knobs (all default 0 = off, v3.37.20 behaviour preserved exactly):
+
+| Flag | Env | Default |
+|---|---|---|
+| `--think-time-base=MS` | `DARIO_THINK_TIME_BASE_MS` | 0 |
+| `--think-time-per-token=MS` | `DARIO_THINK_TIME_PER_TOKEN_MS` | 0 |
+| `--think-time-jitter=MS` | `DARIO_THINK_TIME_JITTER_MS` | 0 |
+| `--think-time-max=MS` | `DARIO_THINK_TIME_MAX_MS` | 30000 |
+| `--session-start-min=MS` | `DARIO_SESSION_START_MIN_MS` | 0 |
+| `--session-start-jitter=MS` | `DARIO_SESSION_START_JITTER_MS` | 0 |
+
+`think_time_delay = base + perToken * lastResponseTokens + U(0, jitter)`, clamped to `max`. Stamped only on 2xx responses so error responses don't pin the next request's delay to `base` needlessly. All three pacing layers (pace, think, session-start) combine with `Math.max` — each enforces an independent floor.
+
+Pure delay calculators live in `src/pacing.ts`, deterministic over `(now, state, cfg, rng)`. 70 unit tests cover short-circuits, base only, perToken scaling, max cap, jitter via injected rng, env precedence, and explicit override precedence.
+
+### Fixed — TS flow narrowing on `upstreamAbortReason`
+
+Widens the declaration via `as UpstreamAbortReason` cast so TS flow narrowing from the synchronous `sse_overflow` assignment in the streaming branch doesn't shadow the callback-based `timeout` / `client_closed` assignments at the catch site. Uncovered when the new pacing code paths shifted line numbers; was latently incorrect in earlier releases.
+
 ## [3.37.20] - 2026-05-14
 
 ### Fixed — `dario login` / `dario proxy` no longer crashes when already running (#266)
