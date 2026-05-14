@@ -11,6 +11,24 @@ checklist.
 
 ## [Unreleased]
 
+## [3.38.2] - 2026-05-14
+
+### Added — `--stealth` preset (#268)
+
+v3.38.0 shipped six knobs for behavioral pacing (think-time + session-start jitter), all defaulting to 0 = off. The feature existed but nobody was going to tune six numbers. `--stealth` flips each resolver's zero-default to a non-zero preset sized for real-CC inter-arrival statistics, all in one flag.
+
+| Knob | v3.38.1 default | Under `--stealth` |
+|---|---|---|
+| `--pace-jitter` | 0 | 300 |
+| `--think-time-base` | 0 | 800 |
+| `--think-time-per-token` | 0 | 4 |
+| `--think-time-jitter` | 0 | 1500 |
+| `--think-time-max` | 30000 | 25000 |
+| `--session-start-min` | 0 | 1200 |
+| `--session-start-jitter` | 0 | 3000 |
+
+Per-knob explicit flags and env vars still win over the stealth default — workflow is *flip stealth on, tune any axis afterwards*. Env mirror: `DARIO_STEALTH=1`. No behavior change when omitted or false — every default stays at zero.
+
 ## [3.38.1] - 2026-05-14
 
 ### Fixed — CodeQL `js/clear-text-logging` false positive on the "already running" banner
